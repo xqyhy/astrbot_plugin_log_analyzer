@@ -68,13 +68,13 @@
   "auto_analyze": {
     "type": "bool",
     "title": "自动分析报错",
-    "description": "抓取日志后是否自动调用AI分析（预留功能）",
+    "description": "检测到错误后自动调用AI分析，分析结果发送给管理员",
     "default": false
   },
   "auto_fix": {
     "type": "bool",
     "title": "自动修复",
-    "description": "分析完成后是否自动执行修复（预留功能）",
+    "description": "检测到错误后自动生成修复建议并询问是否执行，需要开启 Computer 功能",
     "default": false
   },
   "analysis_provider_id": {

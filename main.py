@@ -10,8 +10,18 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 from astrbot import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.platform import Platform
+import astrbot.api.message_components as Comp
+from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
+from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.platform import PlatformStatus
+
+try:
+    from astrbot.core.platform.astr_message_event import MessageSession as MS
+except ImportError:
+    from astrbot.core.platform.message_session import MessageSession as MS
+
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -32,7 +42,7 @@ ALERT_LEVELS = {
 }
 
 
-@register("astrbot_plugin_log_analyzer", "小七月", "日志分析器：自动监控、抓取、分析、修复", "v1.2.0")
+@register("astrbot_plugin_log_analyzer", "小七月", "日志分析器：自动监控、抓取、分析、修复", "v1.3.0")
 class LogAnalyzerPlugin(Star):
     """
     日志分析器插件：
@@ -65,6 +75,8 @@ class LogAnalyzerPlugin(Star):
         self._alert_timestamps: Dict[str, float] = {}
         # 错误统计数据
         self._error_stats: Dict[str, Dict[str, Any]] = {}
+        # 待执行的修复命令 {admin_id: {commands, keyword, timestamp}}
+        self._pending_fix_commands: Dict[str, Dict[str, Any]] = {}
         
         # 平台引用
         self._platform: Optional[Platform] = None
@@ -165,29 +177,30 @@ class LogAnalyzerPlugin(Star):
         if stats["total"] % 10 == 0:
             self._save_stats()
 
-    async def _get_platform(self) -> Optional[Platform]:
-        """获取平台实例"""
-        if self._platform:
-            return self._platform
-        try:
-            platforms = getattr(self.context, "platforms", {})
-            if platforms:
-                self._platform = list(platforms.values())[0]
-                return self._platform
-        except Exception as e:
-            logger.warning(f"[LogAnalyzer] 获取平台实例失败: {e}")
-        return None
-
     async def _send_to_admin(self, message: str, admin_id: str):
         """发送消息给管理员"""
-        platform = await self._get_platform()
-        if not platform:
-            logger.warning("[LogAnalyzer] 无法获取平台实例，跳过发送")
-            return
-        
         try:
-            session_id = f"aiocqhttp:FriendMessage:{admin_id}"
-            await platform.send_by_session(session_id, message)
+            chain = MessageChain([Comp.Plain(message)])
+            
+            # 找到一个正在运行的平台
+            platforms = self.context.platform_manager.get_insts()
+            target_platform = None
+            
+            for p in platforms:
+                if p.status == PlatformStatus.RUNNING:
+                    target_platform = p
+                    break
+            
+            if not target_platform:
+                logger.error("[LogAnalyzer] 没有找到运行中的平台")
+                return
+            
+            platform_id = target_platform.meta().id
+            logger.info(f"[LogAnalyzer] 使用平台 {platform_id} 发送消息")
+            
+            # 使用平台的 send_by_session 方法发送
+            session_obj = MS(platform_name=platform_id, message_type=MessageType.FRIEND_MESSAGE, session_id=admin_id)
+            await target_platform.send_by_session(session_obj, chain)
             logger.info(f"[LogAnalyzer] 已发送日志通知给管理员 {admin_id}")
         except Exception as e:
             logger.error(f"[LogAnalyzer] 发送消息失败: {e}")
@@ -234,6 +247,131 @@ class LogAnalyzerPlugin(Star):
         
         logger.info("[LogAnalyzer] 监控已停止")
 
+    async def _analyze_logs_with_ai(self, logs: List[str], keyword: str) -> Optional[str]:
+        """使用AI分析日志"""
+        try:
+            # 构造分析提示
+            log_text = "\n".join(logs[:20])  # 限制日志数量
+            prompt = f"""请用一句话简要分析以下日志问题（关键词：{keyword}）：
+
+{log_text}
+
+格式：问题：xxx，原因：xxx，建议：xxx
+"""
+            
+            # 获取LLM provider
+            provider = None
+            if self.analysis_provider_id:
+                provider = self.context.get_provider_by_id(self.analysis_provider_id)
+            
+            if not provider:
+                # 尝试获取默认provider
+                provider = self.context.get_using_provider()
+            
+            if not provider:
+                logger.warning("[LogAnalyzer] 没有可用的LLM provider，跳过AI分析")
+                return None
+            
+            # 调用LLM分析
+            model = self.analysis_model_name or None
+            response = await provider.text_chat(prompt, model=model)
+            
+            if response and hasattr(response, 'completion_text'):
+                return response.completion_text
+            elif isinstance(response, str):
+                return response
+            
+            return None
+        except Exception as e:
+            logger.error(f"[LogAnalyzer] AI分析失败: {e}")
+            return None
+
+    async def _generate_fix_suggestion(self, logs: List[str], keyword: str) -> Optional[str]:
+        """生成修复建议"""
+        try:
+            log_text = "\n".join(logs[:10])
+            fix_prompt = f"""请分析以下日志（关键词：{keyword}），制定修复方案：
+
+{log_text}
+
+请提供可执行的 shell 命令来修复这个问题，只返回命令，不要有其他内容：
+```bash
+# 你的命令
+```
+"""
+            
+            # 获取LLM provider
+            provider = None
+            if self.analysis_provider_id:
+                provider = self.context.get_provider_by_id(self.analysis_provider_id)
+            
+            if not provider:
+                provider = self.context.get_using_provider()
+            
+            if not provider:
+                return None
+            
+            model = self.analysis_model_name or None
+            response = await provider.text_chat(fix_prompt, model=model)
+            
+            if response and hasattr(response, 'completion_text'):
+                return response.completion_text
+            elif isinstance(response, str):
+                return response
+            
+            return None
+        except Exception as e:
+            logger.error(f"[LogAnalyzer] 生成修复建议失败: {e}")
+            return None
+
+    def _extract_commands(self, text: str) -> List[str]:
+        """从文本中提取shell命令"""
+        import re
+        # 提取 ```bash ... ``` 中的命令
+        pattern = r"```(?:bash|sh)?\s*\n(.*?)\n```"
+        matches = re.findall(pattern, text, re.DOTALL)
+        
+        commands = []
+        for match in matches:
+            lines = match.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                # 跳过注释和空行
+                if line and not line.startswith('#'):
+                    commands.append(line)
+        
+        return commands
+
+    async def _execute_fix_command(self, command: str, admin_id: str) -> str:
+        """使用Computer功能执行修复命令"""
+        try:
+            from astrbot.core.computer.computer_client import get_booter
+            
+            # 获取 Computer booter
+            session_id = f"{admin_id}:FriendMessage:{admin_id}"
+            booter = await get_booter(self.context, session_id)
+            
+            if not booter:
+                return "❌ Computer 功能未启用，请先开启 AstrBot 的电脑功能"
+            
+            logger.info(f"[LogAnalyzer] 执行修复命令: {command}")
+            result = await booter.shell.exec(command)
+            
+            stdout = result.get("stdout", "") or result.get("output", "")
+            stderr = result.get("stderr", "") or result.get("error", "")
+            success = result.get("success", False)
+            
+            output = f"{'✅ 命令执行成功' if success else '❌ 命令执行失败'}\n\n"
+            if stdout:
+                output += f"输出:\n{stdout}\n"
+            if stderr:
+                output += f"错误:\n{stderr}\n"
+            
+            return output
+        except Exception as e:
+            logger.error(f"[LogAnalyzer] 执行命令失败: {e}")
+            return f"❌ 执行命令失败: {e}"
+
     async def _check_log_file(self):
         """检查日志文件的新增内容"""
         if not os.path.isfile(self.log_path):
@@ -259,6 +397,7 @@ class LogAnalyzerPlugin(Star):
                 "warning": [],
                 "info": []
             }
+            matched_keywords: Set[str] = set()
             
             for line in new_lines:
                 line = line.rstrip()
@@ -278,6 +417,7 @@ class LogAnalyzerPlugin(Star):
                             if line_hash not in self._sent_hashes:
                                 matched_by_level[level].append(line)
                                 self._sent_hashes.add(line_hash)
+                                matched_keywords.add(keyword)
                         break
             
             # 发送告警（按级别从高到低）
@@ -301,6 +441,54 @@ class LogAnalyzerPlugin(Star):
                         await self._send_to_admin(message, admin_id)
                     
                     logger.info(f"[LogAnalyzer] 已发送 {level_name} 告警: {len(lines)} 条")
+                
+                # 自动分析功能
+                if self.auto_analyze and matched_keywords:
+                    logger.info("[LogAnalyzer] 自动分析已启用，开始AI分析...")
+                    for keyword in matched_keywords:
+                        # 获取包含该关键词的日志
+                        keyword_logs = [line for line in new_lines if keyword.lower() in line.lower()]
+                        if keyword_logs:
+                            analysis = await self._analyze_logs_with_ai(keyword_logs[:10], keyword)
+                            if analysis:
+                                analysis_msg = f"🤖 AI 分析结果（关键词：{keyword}）：\n\n{analysis}"
+                                for admin_id in self.admins_id:
+                                    await self._send_to_admin(analysis_msg, admin_id)
+                                logger.info(f"[LogAnalyzer] 已发送AI分析结果: {keyword}")
+                
+                # 自动修复功能（生成修复建议）
+                if self.auto_fix and matched_keywords:
+                    logger.info("[LogAnalyzer] 自动修复已启用，生成修复建议...")
+                    for keyword in matched_keywords:
+                        keyword_logs = [line for line in new_lines if keyword.lower() in line.lower()]
+                        if keyword_logs:
+                            # 生成修复建议
+                            fix_suggestion = await self._generate_fix_suggestion(keyword_logs[:10], keyword)
+                            
+                            if fix_suggestion:
+                                # 提取命令
+                                commands = self._extract_commands(fix_suggestion)
+                                
+                                if commands:
+                                    # 发送修复建议并询问是否执行
+                                    fix_msg = f"🔧 修复建议（关键词：{keyword}）：\n\n{fix_suggestion}\n\n\n⚠️ 发送「确认执行修复」自动执行以上命令，或忽略此消息。"
+                                    
+                                    # 存储待执行的命令
+                                    for admin_id in self.admins_id:
+                                        self._pending_fix_commands[admin_id] = {
+                                            "commands": commands,
+                                            "keyword": keyword,
+                                            "timestamp": time.time()
+                                        }
+                                        await self._send_to_admin(fix_msg, admin_id)
+                                    
+                                    logger.info(f"[LogAnalyzer] 已发送修复建议: {keyword}, 命令数: {len(commands)}")
+                                else:
+                                    # 没有提取到命令，发送原始建议
+                                    fix_msg = f"🔧 修复建议（关键词：{keyword}）：\n\n{fix_suggestion}"
+                                    for admin_id in self.admins_id:
+                                        await self._send_to_admin(fix_msg, admin_id)
+                                    logger.info(f"[LogAnalyzer] 已发送修复建议: {keyword}")
                 
         except Exception as e:
             logger.error(f"[LogAnalyzer] 检查日志文件失败: {e}")
@@ -836,6 +1024,57 @@ class LogAnalyzerPlugin(Star):
         yield event.plain_result("请先用「日志修复」生成修复方案，再复制命令用「日志执行修复」执行")
         event.stop_event()
         return
+
+    @filter.command("确认执行修复", priority=10001)
+    async def cmd_confirm_fix(self, event: AstrMessageEvent):
+        """确认执行自动修复命令"""
+        if not await self._is_admin(event):
+            yield event.plain_result("⚠️ 没有权限使用此命令")
+            event.stop_event()
+            return
+        
+        admin_id = str(event.get_sender_id())
+        
+        # 检查是否有待执行的命令
+        if admin_id not in self._pending_fix_commands:
+            yield event.plain_result("⚠️ 没有待执行的修复命令")
+            event.stop_event()
+            return
+        
+        pending = self._pending_fix_commands[admin_id]
+        commands = pending.get("commands", [])
+        keyword = pending.get("keyword", "")
+        timestamp = pending.get("timestamp", 0)
+        
+        # 检查是否超时（5分钟）
+        if time.time() - timestamp > 300:
+            del self._pending_fix_commands[admin_id]
+            yield event.plain_result("⚠️ 修复命令已超时，请重新生成")
+            event.stop_event()
+            return
+        
+        if not commands:
+            del self._pending_fix_commands[admin_id]
+            yield event.plain_result("⚠️ 没有可执行的命令")
+            event.stop_event()
+            return
+        
+        # 执行命令
+        yield event.plain_result(f"🔧 开始执行 {len(commands)} 个修复命令...")
+        
+        results = []
+        for i, cmd in enumerate(commands, 1):
+            logger.info(f"[LogAnalyzer] 执行修复命令 {i}/{len(commands)}: {cmd}")
+            result = await self._execute_fix_command(cmd, admin_id)
+            results.append(f"命令 {i}: {cmd}\n{result}")
+        
+        # 清除待执行命令
+        del self._pending_fix_commands[admin_id]
+        
+        # 发送执行结果
+        result_msg = f"🔧 修复执行完成（关键词：{keyword}）\n\n" + "\n\n".join(results)
+        yield event.plain_result(result_msg)
+        event.stop_event()
 
     @filter.command("日志路径", priority=10001)
     async def cmd_set_log_path(self, event: AstrMessageEvent):
