@@ -1,14 +1,255 @@
-# astrbot-plugin-helloworld
+# AstrBot 日志分析器插件
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+一个功能强大的 AstrBot 插件，用于自动监控、抓取、分析和修复日志问题。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## ✨ 功能特性
 
-# Supports
+### 🔍 自动监控
+- 后台定时扫描日志文件（可配置扫描间隔）
+- 匹配到关键词后自动发送给配置的管理员
+- 智能去重机制，已发送的日志不会重复通知
+- 支持日志文件轮转检测
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+### 🚨 告警优化（v1.2.0 新增）
+- **告警阈值**：同一错误出现 N 次才告警，避免单次错误打扰
+- **告警静默期**：某错误告警后，同类错误在 N 分钟内不再重复告警
+- **关键词分级**：不同关键词设置不同告警级别（严重/错误/警告）
+
+### 📊 错误统计（v1.2.0 新增）
+- 统计各类错误出现的次数、频率
+- 按日期、小时统计错误分布
+- 查看 Top 10 高频错误
+- 支持清空统计数据
+
+### ⚙️ 热更新配置（v1.2.0 新增）
+- 修改配置后无需重启插件
+- 支持通过命令添加/删除监控关键词
+- 配置修改立即生效
+
+### 📋 手动抓取
+- 按关键词搜索日志内容
+- 支持时间范围过滤（`--since` / `--until`）
+- 支持多种时间格式
+
+### 🤖 AI 分析
+- 抓取日志后调用 AI 分析报错原因
+- 自动生成问题诊断和解决建议
+- 支持指定分析模型提供商
+
+### 🔧 修复方案
+- AI 分析后生成可执行的修复命令
+- 危险命令自动拦截
+- 执行前需二次确认
+
+## 📦 安装
+
+将插件文件夹放入 AstrBot 的 `data/plugins/` 目录下，重启 AstrBot 或在管理面板中启用插件。
+
+## ⚙️ 配置
+
+在 AstrBot 管理面板中配置以下选项：
+
+### 基础配置
+
+| 配置项 | 类型 | 说明 | 默认值 |
+|:---|:---|:---|:---|
+| `log_path` | string | 日志文件路径，留空使用默认路径 | `""` |
+| `admins_id` | list | 管理员 ID 列表（权限控制 + 通知接收者） | `[]` |
+| `monitor_enabled` | bool | 是否启用自动监控 | `false` |
+| `monitor_interval` | int | 扫描间隔（秒） | `30` |
+
+### 关键词配置
+
+| 配置项 | 类型 | 说明 | 默认值 |
+|:---|:---|:---|:---|
+| `monitor_keywords` | list | 监控关键词列表，为空不启动监控 | `["ERROR", "Exception", "Traceback", "CRITICAL", "FATAL"]` |
+| `critical_keywords` | list | 严重级别关键词 | `["CRITICAL", "FATAL", "PANIC"]` |
+| `error_keywords` | list | 错误级别关键词 | `["ERROR", "Exception", "Traceback", "Failed"]` |
+| `warning_keywords` | list | 警告级别关键词 | `["WARNING", "WARN"]` |
+
+### 告警配置（v1.2.0 新增）
+
+| 配置项 | 类型 | 说明 | 默认值 |
+|:---|:---|:---|:---|
+| `alert_threshold` | int | 同一关键词出现N次后才告警 | `1` |
+| `alert_cooldown` | int | 告警静默期（秒） | `300` |
+
+### 模型配置
+
+| 配置项 | 类型 | 说明 | 默认值 |
+|:---|:---|:---|:---|
+| `analysis_provider_id` | string | 分析模型提供商ID，留空使用当前会话 | `""` |
+| `analysis_model_name` | string | 分析模型名称，留空使用提供商默认模型 | `""` |
+| `auto_analyze` | bool | 抓取后自动分析（预留功能） | `false` |
+| `auto_fix` | bool | 自动执行修复（预留功能） | `false` |
+
+### 配置示例
+
+```json
+{
+  "log_path": "",
+  "admins_id": ["12345678", "87654321"],
+  "monitor_enabled": true,
+  "monitor_keywords": ["ERROR", "Exception", "Traceback", "CRITICAL"],
+  "critical_keywords": ["CRITICAL", "FATAL"],
+  "error_keywords": ["ERROR", "Exception"],
+  "warning_keywords": ["WARNING", "WARN"],
+  "alert_threshold": 3,
+  "alert_cooldown": 600,
+  "monitor_interval": 30,
+  "analysis_provider_id": "",
+  "analysis_model_name": ""
+}
+```
+
+## 🛠️ 命令列表
+
+### 监控控制
+
+| 命令 | 功能 | 示例 |
+|:---|:---|:---|
+| `日志监控状态` | 查看监控运行状态 | `日志监控状态` |
+| `日志监控 启动` | 启动后台监控 | `日志监控 启动` |
+| `日志监控 停止` | 停止后台监控 | `日志监控 停止` |
+
+### 统计功能（v1.2.0 新增）
+
+| 命令 | 功能 | 示例 |
+|:---|:---|:---|
+| `日志统计` | 查看错误统计 | `日志统计` |
+| `日志统计 清空` | 清空统计数据 | `日志统计 清空` |
+
+### 配置管理（v1.2.0 新增）
+
+| 命令 | 功能 | 示例 |
+|:---|:---|:---|
+| `日志配置 热更新` | 热更新配置 | `日志配置 热更新` |
+| `日志关键词 添加` | 添加监控关键词 | `日志关键词 添加 ConnectionError` |
+| `日志关键词 删除` | 删除监控关键词 | `日志关键词 删除 ConnectionError` |
+
+### 日志操作
+
+| 命令 | 功能 | 示例 |
+|:---|:---|:---|
+| `日志抓取` | 手动抓取日志 | `日志抓取 ERROR --since "11:00"` |
+| `日志分析` | 抓取 + AI 分析 | `日志分析 Exception` |
+| `日志修复` | 抓取 + 分析 + 修复方案 | `日志修复 ERROR` |
+| `日志执行修复` | 执行修复命令 | `日志执行修复 systemctl restart astrbot` |
+| `日志路径` | 查看/设置日志路径 | `日志路径` |
+
+## 📖 使用示例
+
+### 1. 启动自动监控
+
+```
+日志监控 启动
+```
+
+当日志中出现配置的关键词时，插件会自动发送通知给配置中的 `admins_id` 用户。
+
+### 2. 查看错误统计
+
+```
+日志统计
+```
+
+显示 Top 10 高频错误及其出现次数。
+
+### 3. 调整告警阈值
+
+在配置文件中设置：
+```json
+{
+  "alert_threshold": 5,
+  "alert_cooldown": 600
+}
+```
+
+然后执行热更新：
+```
+日志配置 热更新
+```
+
+### 4. 动态添加关键词
+
+```
+日志关键词 添加 ConnectionTimeout
+```
+
+无需重启，立即生效。
+
+## 🔒 权限控制
+
+- 只有 `admins_id` 列表中的用户才能使用所有命令
+- 群主、群管理员默认无权限（除非在列表中）
+- 自动监控通知只发送给 `admins_id` 中的用户
+
+## ⚠️ 安全特性
+
+### 危险命令拦截
+
+以下危险命令会被自动拦截，拒绝执行：
+
+- `rm -rf` - 递归删除
+- `mkfs` - 格式化磁盘
+- `dd if=` - 磁盘写入
+- `chmod 777 /` - 危险权限修改
+- `:(){ :|:& };:` - Fork 炸弹
+
+### 执行确认
+
+所有修复命令执行前都需要二次确认，防止误操作。
+
+## 📋 告警级别说明
+
+| 级别 | 图标 | 说明 | 默认关键词 |
+|:---|:---|:---|:---|
+| 严重 | 🔴 | 系统崩溃、致命错误 | CRITICAL, FATAL, PANIC |
+| 错误 | 🟠 | 功能异常、请求失败 | ERROR, Exception, Traceback, Failed |
+| 警告 | 🟡 | 潜在问题、性能下降 | WARNING, WARN |
+| 信息 | 🔴 | 一般信息（暂未使用） | - |
+
+## 📁 插件文件结构
+
+```
+astrbot_plugin_log_analyzer/
+├── main.py              # 主代码
+├── metadata.yaml        # 插件元数据
+├── _conf_schema.json    # 配置文件 schema
+└── README.md            # 说明文档
+```
+
+统计文件会自动保存在：
+```
+/AstrBot/data/astrbot_plugin_log_analyzer/error_stats.json
+```
+
+## 🔄 更新日志
+
+### v1.2.0
+- ✨ 新增告警阈值功能，同一错误出现N次才告警
+- ✨ 新增告警静默期，避免重复打扰
+- ✨ 新增关键词分级（严重/错误/警告）
+- ✨ 新增错误统计功能（按日期/小时统计）
+- ✨ 新增热更新配置，修改配置无需重启
+- ✨ 新增在线管理监控关键词
+
+### v1.1.0
+- ✨ 新增自动监控功能
+- ✨ 新增 `日志监控状态`、`日志监控 启动`、`日志监控 停止` 命令
+- 🔒 优化权限控制，只允许配置的管理员使用
+- 🛡️ 关键词为空时不启动监控
+
+### v1.0.0
+- 🎉 初始版本
+- ✨ 日志抓取、分析、修复功能
+
+## 📝 开发者
+
+- 作者：小七月
+- 版本：v1.2.0
+- 适用于：AstrBot
+
+## 📄 许可证
+
+MIT License

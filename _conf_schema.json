@@ -1,0 +1,95 @@
+{
+  "log_path": {
+    "type": "string",
+    "title": "日志文件路径",
+    "description": "留空则使用默认路径 /AstrBot/data/logs/astrbot.log",
+    "default": ""
+  },
+  "admins_id": {
+    "type": "list",
+    "title": "管理员ID列表",
+    "description": "拥有使用权限的用户ID列表，只有在此列表中的用户才能使用插件命令，同时也是日志监控通知的接收者",
+    "default": []
+  },
+  "monitor_enabled": {
+    "type": "bool",
+    "title": "启用自动监控",
+    "description": "是否启用自动监控日志关键词功能",
+    "default": false
+  },
+  "monitor_keywords": {
+    "type": "list",
+    "title": "监控关键词列表",
+    "description": "要监控的关键词列表，匹配到后会自动发送给管理员。为空时不启动监控",
+    "default": ["ERROR", "Exception", "Traceback", "CRITICAL", "FATAL"]
+  },
+  "critical_keywords": {
+    "type": "list",
+    "title": "严重级别关键词",
+    "description": "匹配到这些关键词的告警将标记为「严重」级别",
+    "default": ["CRITICAL", "FATAL", "PANIC"]
+  },
+  "error_keywords": {
+    "type": "list",
+    "title": "错误级别关键词",
+    "description": "匹配到这些关键词的告警将标记为「错误」级别",
+    "default": ["ERROR", "Exception", "Traceback", "Failed"]
+  },
+  "warning_keywords": {
+    "type": "list",
+    "title": "警告级别关键词",
+    "description": "匹配到这些关键词的告警将标记为「警告」级别",
+    "default": ["WARNING", "WARN", "WARN"]
+  },
+  "alert_threshold": {
+    "type": "int",
+    "title": "告警阈值",
+    "description": "同一关键词出现N次后才触发告警，避免单次错误打扰",
+    "default": 1,
+    "minimum": 1,
+    "maximum": 100
+  },
+  "alert_cooldown": {
+    "type": "int",
+    "title": "告警静默期（秒）",
+    "description": "同一关键词告警后，在此时间内不再重复告警",
+    "default": 300,
+    "minimum": 0,
+    "maximum": 3600
+  },
+  "monitor_interval": {
+    "type": "int",
+    "title": "监控扫描间隔（秒）",
+    "description": "扫描日志文件的间隔时间",
+    "default": 15,
+    "minimum": 5,
+    "maximum": 300
+  },
+  "auto_analyze": {
+    "type": "bool",
+    "title": "自动分析报错",
+    "description": "抓取日志后是否自动调用AI分析（预留功能）",
+    "default": false
+  },
+  "auto_fix": {
+    "type": "bool",
+    "title": "自动修复",
+    "description": "分析完成后是否自动执行修复（预留功能）",
+    "default": false
+  },
+  "analysis_provider_id": {
+    "type": "string",
+    "title": "分析模型提供商ID",
+    "description": "用于日志分析的LLM提供商ID，留空则使用当前会话的提供商",
+    "default": "",
+    "hint": "在管理面板中选择要使用的模型提供商",
+    "_special": "select_provider"
+  },
+  "analysis_model_name": {
+    "type": "string",
+    "title": "分析模型名称",
+    "description": "指定分析使用的具体模型，留空则使用提供商默认模型",
+    "default": "",
+    "hint": "例如：gpt-4o-mini、claude-3-haiku 等轻量快速模型"
+  }
+}
