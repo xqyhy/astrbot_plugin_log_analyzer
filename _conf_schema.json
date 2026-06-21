@@ -39,7 +39,7 @@
     "type": "list",
     "title": "警告级别关键词",
     "description": "匹配到这些关键词的告警将标记为「警告」级别",
-    "default": ["WARNING", "WARN", "WARN"]
+    "default": ["WARNING", "WARN"]
   },
   "alert_threshold": {
     "type": "int",
@@ -61,7 +61,7 @@
     "type": "int",
     "title": "监控扫描间隔（秒）",
     "description": "扫描日志文件的间隔时间",
-    "default": 15,
+    "default": 30,
     "minimum": 5,
     "maximum": 300
   },
@@ -76,6 +76,14 @@
     "title": "自动修复",
     "description": "检测到错误后自动生成修复建议并询问是否执行，需要开启 Computer 功能",
     "default": false
+  },
+  "max_fetch_lines": {
+    "type": "int",
+    "title": "最大抓取条目数",
+    "description": "单次抓取最多返回的日志条目/行数，默认500",
+    "default": 500,
+    "minimum": 10,
+    "maximum": 5000
   },
   "analysis_provider_id": {
     "type": "string",

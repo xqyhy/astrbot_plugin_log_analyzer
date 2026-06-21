@@ -42,7 +42,7 @@ ALERT_LEVELS = {
 }
 
 
-@register("astrbot_plugin_log_analyzer", "小七月", "日志分析器：自动监控、抓取、分析、修复", "v1.3.0")
+@register("astrbot_plugin_log_analyzer", "小七月", "日志分析器：自动监控、抓取、分析、修复", "v1.4.0")
 class LogAnalyzerPlugin(Star):
     """
     日志分析器插件：
@@ -77,6 +77,8 @@ class LogAnalyzerPlugin(Star):
         self._error_stats: Dict[str, Dict[str, Any]] = {}
         # 待执行的修复命令 {admin_id: {commands, keyword, timestamp}}
         self._pending_fix_commands: Dict[str, Dict[str, Any]] = {}
+        # 分页缓存 {admin_id: {logs, keyword, since, until, timestamp}}
+        self._page_cache: Dict[str, Dict[str, Any]] = {}
         
         # 平台引用
         self._platform: Optional[Platform] = None
@@ -106,6 +108,9 @@ class LogAnalyzerPlugin(Star):
         # 告警阈值配置
         self.alert_threshold = self.config.get("alert_threshold", 1)  # 出现N次才告警
         self.alert_cooldown = self.config.get("alert_cooldown", 300)  # 静默期（秒）
+        
+        # 抓取相关配置
+        self.max_fetch_lines = int(self.config.get("max_fetch_lines", 500))  # 最大抓取行数
 
     def _load_stats(self):
         """加载历史统计数据"""
@@ -173,8 +178,8 @@ class LogAnalyzerPlugin(Star):
             stats["by_hour"][hour_key] = 0
         stats["by_hour"][hour_key] += 1
         
-        # 定期保存
-        if stats["total"] % 10 == 0:
+        # 定期保存（每 3 次）
+        if stats["total"] % 3 == 0:
             self._save_stats()
 
     async def _send_to_admin(self, message: str, admin_id: str):
@@ -206,9 +211,31 @@ class LogAnalyzerPlugin(Star):
             logger.error(f"[LogAnalyzer] 发送消息失败: {e}")
 
     def _hash_keyword(self, keyword: str) -> str:
-        """生成关键词的hash"""
-        import hashlib
-        return hashlib.md5(keyword.encode()).hexdigest()[:16]
+        """生成关键词的唯一key"""
+        return str(keyword)
+
+    def _cleanup_memory(self):
+        """清理过期的内存缓存，防止无限增长"""
+        now = time.time()
+        # 清理超过 2 小时的 sent_hashes（直接全量清空，反正文件轮转后就不需要了）
+        if len(self._sent_hashes) > 5000:
+            logger.info(f"[LogAnalyzer] 清理 _sent_hashes（{len(self._sent_hashes)} 条）")
+            self._sent_hashes.clear()
+        # 清理超过 1 小时的告警计数器
+        expired_hashes = [h for h, ts in self._alert_timestamps.items() if now - ts > 3600]
+        for h in expired_hashes:
+            self._alert_counts.pop(h, None)
+            self._alert_timestamps.pop(h, None)
+        if expired_hashes:
+            logger.info(f"[LogAnalyzer] 清理了 {len(expired_hashes)} 条过期告警记录")
+        # 清理超过 10 分钟的 pending_fix_commands
+        expired_fix = [uid for uid, d in self._pending_fix_commands.items() if now - d.get("timestamp", 0) > 600]
+        for uid in expired_fix:
+            del self._pending_fix_commands[uid]
+        # 清理过期的 page_cache
+        expired_cache = [uid for uid, d in self._page_cache.items() if now - d.get("timestamp", 0) > 600]
+        for uid in expired_cache:
+            del self._page_cache[uid]
 
     def _should_alert(self, keyword: str) -> bool:
         """判断是否应该告警（考虑阈值和静默期）"""
@@ -237,11 +264,18 @@ class LogAnalyzerPlugin(Star):
         logger.info(f"[LogAnalyzer] 监控关键词: {self.monitor_keywords}")
         logger.info(f"[LogAnalyzer] 告警阈值: {self.alert_threshold}, 静默期: {self.alert_cooldown}秒")
         
+        cycle_count = 0
         while self.monitor_enabled:
             try:
                 await self._check_log_file()
             except Exception as e:
                 logger.error(f"[LogAnalyzer] 监控出错: {e}")
+            
+            # 每 100 轮清理一次内存缓存
+            cycle_count += 1
+            if cycle_count >= 100:
+                self._cleanup_memory()
+                cycle_count = 0
             
             await asyncio.sleep(self.monitor_interval)
         
@@ -326,7 +360,6 @@ class LogAnalyzerPlugin(Star):
 
     def _extract_commands(self, text: str) -> List[str]:
         """从文本中提取shell命令"""
-        import re
         # 提取 ```bash ... ``` 中的命令
         pattern = r"```(?:bash|sh)?\s*\n(.*?)\n```"
         matches = re.findall(pattern, text, re.DOTALL)
@@ -523,7 +556,8 @@ class LogAnalyzerPlugin(Star):
         return str(event.get_sender_id()) in self.admins_id
 
     def _parse_time(self, time_str: str) -> Optional[datetime]:
-        """解析时间字符串"""
+        """解析时间字符串，支持不补零的月日（如 2026-6-21）"""
+        # 先尝试标准格式
         formats = [
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M",
@@ -540,6 +574,20 @@ class LogAnalyzerPlugin(Star):
                 return dt
             except ValueError:
                 continue
+        
+        # 正则兜底：支持 2026-6-21、2026-6-21 13:57、2026-6-21 13:57:30 等不补零格式
+        m = re.match(
+            r"^(\d{4})-(\d{1,2})-(\d{1,2})"
+            r"(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$",
+            time_str.strip(),
+        )
+        if m:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            h = int(m.group(4)) if m.group(4) else 0
+            mi = int(m.group(5)) if m.group(5) else 0
+            s = int(m.group(6)) if m.group(6) else 0
+            return datetime(y, mo, d, h, mi, s)
+        
         return None
 
     def _parse_log_time(self, log_line: str) -> Optional[datetime]:
@@ -559,22 +607,27 @@ class LogAnalyzerPlugin(Star):
         until: Optional[datetime] = None,
         max_lines: int = 100,
     ) -> List[str]:
-        """从日志文件提取匹配关键词的日志行"""
+        """从日志文件提取匹配关键词的日志行
+        
+        当指定 since/until 时：按"日志条目"模式匹配 ——
+        识别以时间戳开头的行作为条目头，关键词只匹配条目头，
+        匹配成功则输出整个条目（含后续堆栈行），直到遇到下一条目头。
+        
+        无 since/until 时：全文逐行匹配（原有行为）。
+        """
         if not os.path.isfile(self.log_path):
             logger.error(f"[LogAnalyzer] 日志文件不存在: {self.log_path}")
             return []
-
+        
+        if since or until:
+            lines, _ = self._extract_log_entries(keyword, since, until, max_entries=max_lines)
+            return lines
+        
+        # 无时间参数：原有全文逐行匹配
         results = []
         try:
             with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    if since or until:
-                        log_time = self._parse_log_time(line)
-                        if log_time:
-                            if since and log_time < since:
-                                continue
-                            if until and log_time > until:
-                                continue
                     if keyword.lower() in line.lower():
                         results.append(line.rstrip())
                         if len(results) >= max_lines:
@@ -584,6 +637,81 @@ class LogAnalyzerPlugin(Star):
             return []
 
         return results
+    
+    def _extract_log_entries(
+        self,
+        keyword: str,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        max_entries: int = 100,
+    ):
+        """按"日志条目"抓取：关键词只匹配条目头部，但输出完整条目。
+        
+        Returns:
+            (lines, count): (所有匹配行的列表, 匹配到的条目数量)
+        """
+        results = []
+        matched = 0
+        
+        try:
+            # 有时间过滤时，从尾部读取（性能优化：避免全量扫描）
+            if since or until:
+                lines = self._read_last_lines(n=self.max_fetch_lines * 5)
+            else:
+                with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [l.rstrip() for l in f]
+            
+            cur_lines = []
+            cur_time = None
+            cur_head = ""
+            
+            for line in lines:
+                s = line.rstrip() if not isinstance(line, str) else line
+                t = self._parse_log_time(s)
+                
+                if t:
+                    if cur_head:
+                        if self._entry_matches(cur_head, keyword, cur_time, since, until):
+                            results.append("\n".join(cur_lines))
+                            matched += 1
+                            if matched >= max_entries:
+                                return results, matched
+                    cur_lines = [s]
+                    cur_time = t
+                    cur_head = s
+                else:
+                    if cur_head:
+                        cur_lines.append(s)
+            
+            if cur_head:
+                if self._entry_matches(cur_head, keyword, cur_time, since, until):
+                    results.append("\n".join(cur_lines))
+                    matched += 1
+        except Exception as e:
+            logger.error(f"[LogAnalyzer] 读取日志失败: {e}")
+            return [], 0
+        
+        return results, matched
+    
+    def _entry_matches(
+        self,
+        head_line: str,
+        keyword: str,
+        entry_time: Optional[datetime],
+        since: Optional[datetime],
+        until: Optional[datetime],
+    ) -> bool:
+        """检查一个日志条目头部是否匹配关键词 + 时间范围"""
+        # 时间过滤
+        if entry_time:
+            if since and entry_time < since:
+                return False
+            if until and entry_time > until:
+                return False
+        # 关键词匹配头部
+        if keyword.lower() in head_line.lower():
+            return True
+        return False
 
     def _format_time_range(self, since: Optional[datetime], until: Optional[datetime]) -> str:
         """格式化时间范围描述"""
@@ -593,6 +721,58 @@ class LogAnalyzerPlugin(Star):
         if until:
             parts.append(f"到 {until.strftime('%Y-%m-%d %H:%M:%S')}")
         return " ".join(parts) if parts else "全部时间"
+
+    def _parse_command_args(self, text: str, command_name: str) -> Dict[str, Any]:
+        """统一解析日志命令的参数（--since/--until/--page）
+        
+        Returns: {"keyword": str, "since": datetime|None, "until": datetime|None, "page": int}
+        """
+        # 去掉命令前缀
+        cleaned = re.sub(r"^[%#/!?\s]*" + re.escape(command_name) + r"\s*", "", text).strip()
+        
+        page = 1
+        since = None
+        until = None
+        
+        # 解析 --page
+        page_match = re.search(r"--page\s+(\d+)", cleaned)
+        if page_match:
+            page = int(page_match.group(1))
+            cleaned = cleaned.replace(page_match.group(0), "").strip()
+        
+        # 解析 --since（支持带引号的时间）
+        since_match = re.search(r"""--since\s+["']?([^"']+)["']?""", cleaned)
+        if since_match:
+            since = self._parse_time(since_match.group(1))
+            cleaned = cleaned.replace(since_match.group(0), "").strip()
+        
+        # 解析 --until
+        until_match = re.search(r"""--until\s+["']?([^"']+)["']?""", cleaned)
+        if until_match:
+            until = self._parse_time(until_match.group(1))
+            cleaned = cleaned.replace(until_match.group(0), "").strip()
+        
+        return {"keyword": cleaned.strip(), "since": since, "until": until, "page": page}
+
+    def _read_last_lines(self, n: int = 2000) -> List[str]:
+        """从文件末尾读取最后 N 行（高性能，适合时间过滤查询）"""
+        if not os.path.isfile(self.log_path):
+            return []
+        try:
+            file_size = os.path.getsize(self.log_path)
+            chunk_size = min(file_size, 512 * 1024)  # 最多读 512KB
+            with open(self.log_path, "rb") as f:
+                f.seek(max(0, file_size - chunk_size))
+                raw = f.read()
+            text = raw.decode("utf-8", errors="ignore")
+            all_lines = text.split("\n")
+            # 如果 chunk 不是文件开头，第一行可能是不完整的
+            if file_size > chunk_size:
+                all_lines = all_lines[1:]  # 丢弃可能不完整的第一行
+            return [l for l in all_lines[-n:] if l.strip()]
+        except Exception as e:
+            logger.error(f"[LogAnalyzer] 尾部读取失败: {e}")
+            return []
 
     @filter.command("日志监控状态", priority=10001)
     async def cmd_monitor_status(self, event: AstrMessageEvent):
@@ -804,40 +984,41 @@ class LogAnalyzerPlugin(Star):
 
     @filter.command("日志抓取", priority=10001)
     async def cmd_fetch(self, event: AstrMessageEvent):
-        """日志抓取 关键词 [--since 时间] [--until 时间]"""
+        """日志抓取 关键词 [--since 时间] [--until 时间] [--page N]"""
         if not await self._is_admin(event):
             yield event.plain_result("⚠️ 没有权限使用此命令")
             event.stop_event()
             return
 
         text = event.message_str
-        text = re.sub(r"^日志抓取\s*", "", text).strip()
-        if not text:
-            yield event.plain_result("格式：日志抓取 关键词 [--since 时间] [--until 时间]")
-            event.stop_event()
-            return
-
-        keyword = ""
-        since = None
-        until = None
-
-        since_match = re.search(r"--since\s+[\"']?([^\"']+)[\"']?", text)
-        if since_match:
-            since = self._parse_time(since_match.group(1))
-            text = text.replace(since_match.group(0), "").strip()
-
-        until_match = re.search(r"--until\s+[\"']?([^\"']+)[\"']?", text)
-        if until_match:
-            until = self._parse_time(until_match.group(1))
-            text = text.replace(until_match.group(0), "").strip()
-
-        keyword = text.strip()
+        args = self._parse_command_args(text, "日志抓取")
+        keyword = args["keyword"]
+        since = args["since"]
+        until = args["until"]
+        page = args["page"]
+        
         if not keyword:
-            yield event.plain_result("请指定要搜索的关键词")
+            yield event.plain_result("格式：日志抓取 关键词 [--since 时间] [--until 时间] [--page N]")
             event.stop_event()
             return
 
-        logs = self._extract_logs(keyword, since, until)
+        admin_id = str(event.get_sender_id())
+        
+                # 检查缓存：相同关键词+时间范围+5分钟内可用缓存翻页
+        cache_key = f"{keyword}_{since}_{until}"
+        _entry_count = 0
+        is_cached = False
+        cached = self._page_cache.get(admin_id)
+        if cached and cached.get("cache_key") == cache_key:
+            if time.time() - cached.get("timestamp", 0) < 300:
+                logs = cached["logs"]
+                _entry_count = cached.get("entry_count", 0)
+                is_cached = True
+            else:
+                del self._page_cache[admin_id]
+                logs = self._extract_logs(keyword, since, until, max_lines=self.max_fetch_lines)
+        else:
+            logs = self._extract_logs(keyword, since, until, max_lines=self.max_fetch_lines)
 
         if not logs:
             time_range = self._format_time_range(since, until)
@@ -845,11 +1026,44 @@ class LogAnalyzerPlugin(Star):
             event.stop_event()
             return
 
+        # 首次提取时缓存结果并统计条目数
+        if not is_cached:
+            if since or until:
+                _, _entry_count = self._extract_log_entries(keyword, since, until, max_entries=self.max_fetch_lines)
+            
+            self._page_cache[admin_id] = {
+                "logs": logs,
+                "cache_key": cache_key,
+                "keyword": keyword,
+                "since": since,
+                "until": until,
+                "timestamp": time.time(),
+                "entry_count": _entry_count
+            }
+        # 重建翻页用的原始参数字符串
+        page_since_str = since.strftime("%Y-%m-%d %H:%M") if since else ""
+        page_until_str = until.strftime("%Y-%m-%d %H:%M") if until else ""
+
+        # 条目模式每页5条完整日志，行模式每页20行
+        PAGE_SIZE = 5 if (since or until) else 20
+        total_pages = (len(logs) + PAGE_SIZE - 1) // PAGE_SIZE
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * PAGE_SIZE
+        end = min(start + PAGE_SIZE, len(logs))
+
         time_range = self._format_time_range(since, until)
-        result = f"📋 抓取到 {len(logs)} 条日志（{time_range}）\n\n"
-        result += "\n".join(logs[:20])
-        if len(logs) > 20:
-            result += f"\n\n... 还有 {len(logs) - 20} 条日志未显示"
+        ec_str = f" | {_entry_count} 个条目" if _entry_count else ""
+        result = f"📋 抓取到 {len(logs)} 行日志{ec_str}（{time_range}）"
+        result += f" | 第 {page}/{total_pages} 页"
+        if page < total_pages:
+            extra_args = ""
+            if page_since_str:
+                extra_args += f" --since \"{page_since_str}\""
+            if page_until_str:
+                extra_args += f" --until \"{page_until_str}\""
+            result += f"\n💡 发送「日志抓取 {keyword}{extra_args} --page {page+1}」翻下一页"
+        result += "\n\n"
+        result += "\n".join(logs[start:end])
 
         yield event.plain_result(result)
         event.stop_event()
@@ -863,32 +1077,17 @@ class LogAnalyzerPlugin(Star):
             return
 
         text = event.message_str
-        text = re.sub(r"^日志分析\s*", "", text).strip()
-        if not text:
+        args = self._parse_command_args(text, "日志分析")
+        keyword = args["keyword"]
+        since = args["since"]
+        until = args["until"]
+        
+        if not keyword:
             yield event.plain_result("格式：日志分析 关键词 [--since 时间] [--until 时间]")
             event.stop_event()
             return
 
-        keyword = ""
-        since = None
-        until = None
-
-        since_match = re.search(r"--since\s+[\"']?([^\"']+)[\"']?", text)
-        if since_match:
-            since = self._parse_time(since_match.group(1))
-            text = text.replace(since_match.group(0), "").strip()
-
-        until_match = re.search(r"--until\s+[\"']?([^\"']+)[\"']?", text)
-        if until_match:
-            until = self._parse_time(until_match.group(1))
-            text = text.replace(until_match.group(0), "").strip()
-
-        keyword = text.strip()
-        if not keyword:
-            yield event.plain_result("请指定要搜索的关键词")
-            event.stop_event()
-            return
-
+        
         logs = self._extract_logs(keyword, since, until)
 
         if not logs:
@@ -923,32 +1122,17 @@ class LogAnalyzerPlugin(Star):
             return
 
         text = event.message_str
-        text = re.sub(r"^日志修复\s*", "", text).strip()
-        if not text:
+        args = self._parse_command_args(text, "日志修复")
+        keyword = args["keyword"]
+        since = args["since"]
+        until = args["until"]
+        
+        if not keyword:
             yield event.plain_result("格式：日志修复 关键词 [--since 时间] [--until 时间]")
             event.stop_event()
             return
 
-        keyword = ""
-        since = None
-        until = None
-
-        since_match = re.search(r"--since\s+[\"']?([^\"']+)[\"']?", text)
-        if since_match:
-            since = self._parse_time(since_match.group(1))
-            text = text.replace(since_match.group(0), "").strip()
-
-        until_match = re.search(r"--until\s+[\"']?([^\"']+)[\"']?", text)
-        if until_match:
-            until = self._parse_time(until_match.group(1))
-            text = text.replace(until_match.group(0), "").strip()
-
-        keyword = text.strip()
-        if not keyword:
-            yield event.plain_result("请指定要搜索的关键词")
-            event.stop_event()
-            return
-
+        
         logs = self._extract_logs(keyword, since, until)
 
         if not logs:
@@ -1002,12 +1186,19 @@ class LogAnalyzerPlugin(Star):
             event.stop_event()
             return
 
-        dangerous_keywords = ["rm -rf", "mkfs", "dd if=", "> /dev/", "chmod 777 /", ":(){ :|:& };:"]
-        for dk in dangerous_keywords:
-            if dk in text:
+        # 危险命令拦截（set 提高查找效率）
+        DANGEROUS_COMMANDS = {"rm -rf", "mkfs", "dd if=", "> /dev/", "chmod 777 /", ":(){ :|:& };:", "mv / ", "rm -f /"}
+        cmd_lower = text.lower()
+        for dk in DANGEROUS_COMMANDS:
+            if dk in cmd_lower:
                 yield event.plain_result(f"⚠️ 危险命令检测！包含「{dk}」，拒绝执行！")
                 event.stop_event()
                 return
+        # 长度限制 + 混淆检测
+        if len(text) > 500:
+            yield event.plain_result("⚠️ 命令过长（>500字符），拒绝执行！")
+            event.stop_event()
+            return
 
         yield event.plain_result(f"⚠️ 确定要执行以下命令吗？\n\n{text}\n\n再次发送「确认执行」来执行，或发送其他内容取消。")
         event.stop_event()

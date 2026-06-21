@@ -1,6 +1,6 @@
 name: astrbot_plugin_log_analyzer
-desc: 日志分析器 - 自动监控、抓取、分析、修复日志问题（支持告警阈值、关键词分级、热更新配置、错误统计、自动修复）
-version: v1.3.0
+desc: 日志分析器 - 自动监控、抓取、分析、修复日志问题（支持条目模式分页、智能告警、错误统计、热更新配置、性能优化）
+version: v1.4.0
 author: 小七月
 repo: https://github.com/yourname/astrbot_plugin_log_analyzer
 commands:
